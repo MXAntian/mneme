@@ -3,6 +3,8 @@
 > **Save 80-90% memory-related token costs.** Persistent long-term memory for AI agents via MCP — on-demand recall instead of always-inject.  
 > **Works with any MCP-compatible agent**: Claude Code, Cursor, Windsurf, Cline, Continue, and more.
 
+[English](README.md) · [中文](README.zh-CN.md)
+
 ---
 
 ## The Problem: Memory Costs Tokens
@@ -78,6 +80,68 @@ This captures session knowledge automatically when Claude Code compacts context,
 
 ---
 
+## What's New in v2.1 (Memory Hygiene)
+
+Three mechanisms borrowed from memory-decay literature, adapted to the **memory health layer only** — no prompt injection, no mood state machines, no persona modeling. The goal is "make memory ranking realistic over time", not "give the AI feelings".
+
+### Power-Law Decay
+
+Every memory now has a `decay_score` that updates periodically based on age, importance, and reuse:
+
+```
+w(t)  = (1 + t / τ)^(-b_eff)        τ = 24h,  b_base = 0.7
+b_eff = b_base / (1 + importance / 10)
+decay = min(1.0, w × (1 + min(10, access_count) × 0.3))
+```
+
+- High-importance + frequently-recalled records stay near **1.0** (reuse boost saves them)
+- Low-importance + untouched records decay to **~0.2** over a few weeks — but **never disappear**. They still get queried, just rank lower.
+
+Run via `runDecayCycle()` from a maintenance daemon's interval, alongside `expireMemories()` / `promoteMemories()`. CLI: there is no separate script — call from your own daemon or `setInterval`.
+
+Recall scoring (both FTS and hybrid paths) now multiplies by `decay_score`, so naturally-fresh records bubble up without manual TTL tuning. Records that haven't been through a cycle default to `1.0` (backward-compatible).
+
+### Surfaced Random Recall ("I Just Remembered")
+
+When `recall_memory` returns fewer records than requested, there's a **25% chance** of pulling 1-3 records from the **cold pool**:
+
+- `importance >= 8` (genuinely valuable, not noise)
+- Last accessed > 30 days ago (truly cold)
+- `decay_score >= 0.3` (not utterly buried)
+
+Surfaced records carry `recall_source: 'surfaced_random'` so callers can distinguish them from query matches. `buildMemoryContext()` marks them with `[surfaced]` in the output.
+
+This counters the "long tail of high-value memories that decay below the top of normal ranking" problem — useful patterns from months ago can resurface unprompted, modeling the "I just remembered" feeling.
+
+### Supersede Paper Trail
+
+When `store_memory` is called with a `supersedes` array (rowid strings of old records), the new record now:
+
+1. **Inherits** the old records' `prior_versions[]` (chained absorption — full history preserved across multiple supersede generations: v1 → v2 → v3 keeps the v1 content too)
+2. **Pushes** the old records' `content` / `summary` / `created_at` into its own `prior_versions[]`
+3. **Updates** old records' `superseded_by` pointer (existing soft-link mechanism preserved)
+4. `expireMemories()` soft-deletes the old chain on its next pass
+
+Recall returns only the **latest** content. `prior_versions[]` (stored as JSON) is queryable for audit / root-cause / "what did I previously think?" analysis. No history loss when retracting.
+
+### Migrations Directory
+
+Schema changes are now versioned in `migrations/`:
+
+```
+migrations/
+├── 001-add-superseded-by.sql       # supersede pointer column (paper trail prerequisite)
+└── 003-add-decay-and-priors.sql    # decay_score + prior_versions + cold-pool index
+```
+
+Apply in order against your existing `tokenmem.db` (SQLite `ALTER TABLE`). The schema is forward-compatible — pre-migration records get default values (`decay_score = 1.0`, `prior_versions = '[]'`) so existing recall calls keep working.
+
+### Stronger Database Backup Protection
+
+`.gitignore` now covers `*.db.bak` / `*.db.bak-*` / `*.db.bak.*` patterns — previous versions only blocked `*.db.backup-*` which let date-suffixed backups slip through accidentally.
+
+---
+
 ## How It Works
 
 ```
@@ -150,14 +214,17 @@ score = FTS_relevance (40%) + importance (30%) + recency (20%) + access_frequenc
 
 With Memory Transfer Learning overlay:
 ```
-final_score = base_score × level_weight
+final_score = base_score × level_weight × decay_score
   where level_weight = { meta_knowledge: 1.3, semi_abstract: 1.0, concrete_trace: 0.7 }
+        decay_score  = power-law decay × reuse boost   (v2.1, defaults to 1.0)
 ```
 
 In hybrid mode (FTS5 + vector):
 ```
-score = (RRF_score × 0.7 + importance × 0.2 + recency × 0.1) × level_weight
+score = (RRF_score × 0.7 + importance × 0.2 + recency × 0.1) × level_weight × decay_score
 ```
+
+The `× decay_score` multiplier (v2.1) lets long-untouched records rank lower naturally, without manual TTL tuning. See [What's New in v2.1](#whats-new-in-v21-memory-hygiene) above.
 
 ### 9 Memory Categories
 
@@ -327,8 +394,11 @@ Imports Claude Code's auto-memory `.md` files (`~/.claude/projects/*/memory/*.md
 ```
 tokenmem/
 ├── mcp-server.mjs              # MCP server entry point (stdio transport)
-├── index.mjs                   # Core engine: store, recall, hybrid search, compression
+├── index.mjs                   # Core engine: store, recall, hybrid search, compression, decay
 ├── schema.sql                  # SQLite schema (memories, conversations, FTS5, goals)
+├── migrations/                 # Versioned schema migrations (apply in order)
+│   ├── 001-add-superseded-by.sql
+│   └── 003-add-decay-and-priors.sql
 ├── package.json                # 3 dependencies only
 ├── backfill-embeddings.mjs     # Batch embedding backfill script
 ├── migrate-claude-memories.mjs # Claude auto-memory migration tool
@@ -338,7 +408,7 @@ tokenmem/
     └── sqlite-vec-windows-x64/ #   Vector search (asg017/sqlite-vec)
 ```
 
-**~1,600 lines of code. 3 dependencies. No build step.**
+**~1,800 lines of code. 3 dependencies. No build step.**
 
 ---
 

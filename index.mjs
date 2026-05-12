@@ -503,32 +503,88 @@ export function storeMemory(mem) {
   const validLevels = ['concrete_trace', 'semi_abstract', 'meta_knowledge']
   const memoryLevel = validLevels.includes(mem.memoryLevel) ? mem.memoryLevel : 'semi_abstract'
 
+  // Structured supersede (migration 001): when caller passes mem.supersedes (array of
+  // rowid strings), the new record's id will be UPDATEd into old records' superseded_by
+  // pointer. expireMemories soft-deletes the chain on its next pass.
+  const supersedes = Array.isArray(mem.supersedes)
+    ? mem.supersedes.filter(s => typeof s === 'string' && /^\d+$/.test(s.trim())).map(s => s.trim())
+    : []
+
   try {
-    const stmt = db.prepare(`
+    const insertStmt = db.prepare(`
       INSERT INTO memories
         (content, summary, memory_type, category, importance, emotional_impact,
          source, source_id, source_platform, tags, metadata, expires_at,
          compressed_from, is_compressed, memory_level)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
-    const info = stmt.run(
-      mem.content,
-      mem.summary || null,
-      mem.memoryType || 'working',
-      mem.category || 'general',
-      mem.importance || 5,
-      mem.emotionalImpact || 0,
-      mem.source || 'conversation',
-      mem.sourceId || null,
-      mem.sourcePlatform || 'unknown',
-      JSON.stringify(mem.tags || []),
-      JSON.stringify(mem.metadata || {}),
-      expiresAt,
-      JSON.stringify(compressedFrom),
-      isCompressed,
-      memoryLevel,
+    const supersedeStmt = db.prepare(
+      `UPDATE memories SET superseded_by = ? WHERE rowid = ? AND deleted_at IS NULL AND superseded_by IS NULL`
     )
-    return info.lastInsertRowid ? String(info.lastInsertRowid) : null
+    // migration 003: paper trail — on supersede, push old content/summary/ts into the
+    // new record's prior_versions[] (chained: absorbs old's own prior_versions too)
+    const priorsLoadStmt = db.prepare(
+      `SELECT rowid, content, summary, created_at, prior_versions FROM memories WHERE rowid = ?`
+    )
+    const priorsUpdateStmt = db.prepare(
+      `UPDATE memories SET prior_versions = ? WHERE rowid = ?`
+    )
+
+    let newId = null
+    const tx = db.transaction(() => {
+      const info = insertStmt.run(
+        mem.content,
+        mem.summary || null,
+        mem.memoryType || 'working',
+        mem.category || 'general',
+        mem.importance || 5,
+        mem.emotionalImpact || 0,
+        mem.source || 'conversation',
+        mem.sourceId || null,
+        mem.sourcePlatform || 'unknown',
+        JSON.stringify(mem.tags || []),
+        JSON.stringify(mem.metadata || {}),
+        expiresAt,
+        JSON.stringify(compressedFrom),
+        isCompressed,
+        memoryLevel,
+      )
+      newId = info.lastInsertRowid ? String(info.lastInsertRowid) : null
+
+      if (newId && supersedes.length > 0) {
+        // Build prior_versions[] from old records (chained absorption)
+        const priors = []
+        for (const oldRowid of supersedes) {
+          const old = priorsLoadStmt.get(oldRowid)
+          if (!old) continue
+          try {
+            const oldPriors = JSON.parse(old.prior_versions || '[]')
+            if (Array.isArray(oldPriors)) priors.push(...oldPriors)
+          } catch {}
+          priors.push({
+            content: old.content,
+            summary: old.summary || null,
+            merged_at: now,
+            source_rowid: old.rowid,
+            created_at: old.created_at,
+          })
+        }
+        if (priors.length > 0) {
+          try { priorsUpdateStmt.run(JSON.stringify(priors), newId) } catch (e) {
+            log(`storeMemory: prior_versions update failed for ${newId}: ${e.message}`)
+          }
+        }
+        // Point old records' superseded_by to the new id (chain pointer mechanism)
+        let supCount = 0
+        for (const oldRowid of supersedes) {
+          const r = supersedeStmt.run(newId, oldRowid)
+          if (r.changes > 0) supCount++
+        }
+        if (supCount > 0) log(`storeMemory: ${newId} supersedes ${supCount}/${supersedes.length} old memories (priors=${priors.length})`)
+      }
+    })
+    tx()
+    return newId
   } catch (e) {
     log(`storeMemory failed: ${e.message}`)
     return null
@@ -697,7 +753,10 @@ export function recallMemories(opts = {}) {
     const levelWeight = LEVEL_WEIGHT[row.memory_level] || 1.0
 
     const baseScore = (ftsScore * 0.4) + (importanceScore * 0.3) + (timeScore * 0.2) + (accessScore * 0.1)
-    const score = baseScore * levelWeight
+    // migration 003: decay_score as multiplier (periodically updated by runDecayCycle)
+    // Defaults to 1.0 for records that haven't been through a decay cycle — backward compatible
+    const decay = (row.decay_score != null) ? row.decay_score : 1.0
+    const score = baseScore * levelWeight * decay
 
     return { ...row, score, tags: safeJsonParse(row.tags, []), metadata: safeJsonParse(row.metadata, {}) }
   })
@@ -710,7 +769,15 @@ export function recallMemories(opts = {}) {
 
   // Sort by score descending, take top N
   filtered.sort((a, b) => b.score - a.score)
-  const result = filtered.slice(0, limit)
+  let result = filtered.slice(0, limit)
+
+  // migration 003: surfaced_random — when result < limit, 25% chance of pulling
+  // 1-3 records from the cold pool (importance >= 8 AND 30d untouched AND decay >= 0.3)
+  // Skipped when called internally by recallMemoriesHybrid (avoid double-surfacing)
+  if (!opts._internal && queryText && result.length < limit) {
+    const surfaced = surfaceRandomMemories(db, result.map(r => r.rowid), limit - result.length, now)
+    if (surfaced.length > 0) result = result.concat(surfaced)
+  }
 
   // Update last_accessed
   if (result.length > 0) {
@@ -768,9 +835,10 @@ export async function recallMemoriesHybrid(opts = {}) {
   const LEVEL_WEIGHT = { meta_knowledge: 1.3, semi_abstract: 1.0, concrete_trace: 0.7 }
 
   // Parallel: vector query (get embedding) + FTS query
+  // _internal=true so the FTS path doesn't also surface random records (hybrid surfaces once at the end)
   const [queryEmbedding, ftsRows] = await Promise.all([
     generateEmbedding(queryText),
-    Promise.resolve(recallMemories({ ...opts, limit: limit * 3 })),
+    Promise.resolve(recallMemories({ ...opts, limit: limit * 3, _internal: true })),
   ])
 
   // Vector path: KNN top N
@@ -818,18 +886,26 @@ export async function recallMemoriesHybrid(opts = {}) {
   addRanks(ftsRows, 'fts')
   addRanks(vecRows, 'vec')
 
-  // Apply Memory Transfer Learning level weighting + importance + time decay
+  // Apply Memory Transfer Learning level weighting + importance + time decay + decay_score (migration 003)
   const merged = Array.from(rrfScores.values()).map(({ row, rrf, sources }) => {
     const levelWeight = LEVEL_WEIGHT[row.memory_level] || 1.0
     const importanceScore = row.importance / 10
     const age = now - row.created_at
     const timeScore = Math.max(0, 1 - age / THIRTY_DAYS_MS)
-    const score = (rrf * 0.7 + (importanceScore * 0.2 + timeScore * 0.1)) * levelWeight
+    // migration 003: decay_score multiplier (defaults to 1.0 backward-compatible)
+    const decay = (row.decay_score != null) ? row.decay_score : 1.0
+    const score = (rrf * 0.7 + (importanceScore * 0.2 + timeScore * 0.1)) * levelWeight * decay
     return { ...row, score, rrf, recall_sources: sources }
   })
 
   merged.sort((a, b) => b.score - a.score)
-  const result = merged.slice(0, limit)
+  let result = merged.slice(0, limit)
+
+  // migration 003: surfaced_random — when hybrid result < limit, 25% chance of cold pool surface
+  if (result.length < limit) {
+    const surfaced = surfaceRandomMemories(db, result.map(r => r.rowid), limit - result.length, now)
+    if (surfaced.length > 0) result = result.concat(surfaced)
+  }
 
   // Update last_accessed
   if (result.length > 0) {
@@ -971,11 +1047,13 @@ export async function buildMemoryContext(opts = {}) {
     const memLines = memories.map(m => {
       const prefix = { permanent: '[PIN]', long_term: '[LT]', short_term: '[ST]', working: '[W]' }[m.memory_type] || '[?]'
       const levelMark = { meta_knowledge: ' [pattern]', semi_abstract: '', concrete_trace: ' [trace]' }[m.memory_level] || ''
+      // migration 003: mark surfaced_random records so callers know it's an "out of context" recall
+      const surfaceMark = m.recall_source === 'surfaced_random' ? ' [surfaced]' : ''
       const tagStr = m.tags?.length ? ` [${m.tags.join(', ')}]` : ''
       const age = Math.floor((Date.now() - m.created_at) / 86400_000)
       const ageStr = age === 0 ? 'today' : age === 1 ? 'yesterday' : `${age}d ago`
       const text = m.summary || m.content.slice(0, 200)
-      return `${prefix}${levelMark} (${m.category}, importance:${m.importance}, ${ageStr})${tagStr}\n   ${text}`
+      return `${prefix}${levelMark}${surfaceMark} (${m.category}, importance:${m.importance}, ${ageStr})${tagStr}\n   ${text}`
     })
     sections.push(`<recalled-memories>\n${memLines.join('\n')}\n</recalled-memories>`)
   }
@@ -1022,19 +1100,73 @@ export async function buildMemoryContext(opts = {}) {
   ].join('\n')
 }
 
+// ── migration 003: surfaced_random pool ─────────────────────
+// When recall result count < limit, with 25% probability, surface 1-3 records
+// from the cold pool: importance >= 8 AND last_accessed < (now - 30d)
+//   AND decay_score >= 0.3 AND deleted_at IS NULL AND superseded_by IS NULL.
+// Models the "I just remembered something" feeling — covers cold-recall blind
+// spots and lets long-decayed but still-important memories resurface.
+const SURFACE_RANDOM_PROB = 0.25
+const SURFACE_RANDOM_MAX = 3
+const SURFACE_AGE_MS = 30 * 86400_000
+const SURFACE_DECAY_FLOOR = 0.3
+const SURFACE_IMPORTANCE_MIN = 8
+
+function surfaceRandomMemories(db, excludeRowids, slotsAvailable, nowMs) {
+  if (slotsAvailable <= 0) return []
+  if (Math.random() > SURFACE_RANDOM_PROB) return []
+  const cutoff = nowMs - SURFACE_AGE_MS
+  const take = Math.min(SURFACE_RANDOM_MAX, slotsAvailable)
+  const excludeClause = excludeRowids?.length
+    ? `AND rowid NOT IN (${excludeRowids.map(() => '?').join(',')})`
+    : ''
+  try {
+    const rows = db.prepare(`
+      SELECT rowid, * FROM memories
+      WHERE deleted_at IS NULL
+        AND superseded_by IS NULL
+        AND importance >= ?
+        AND last_accessed < ?
+        AND decay_score >= ?
+        ${excludeClause}
+      ORDER BY RANDOM()
+      LIMIT ?
+    `).all(SURFACE_IMPORTANCE_MIN, cutoff, SURFACE_DECAY_FLOOR, ...(excludeRowids || []), take)
+    return rows.map(r => ({
+      ...r,
+      score: 0,
+      tags: safeJsonParse(r.tags, []),
+      metadata: safeJsonParse(r.metadata, {}),
+      recall_source: 'surfaced_random',  // callers can distinguish from query matches
+    }))
+  } catch (e) {
+    log(`surfaceRandomMemories failed: ${e.message}`)
+    return []
+  }
+}
+
 // ── Memory Management ───────────────────────────────────────
 
-/** Clean up expired memories */
+/** Clean up expired memories (both TTL path and supersede chain) */
 export function expireMemories() {
   const db = getDb()
   try {
-    const info = db.prepare(`
+    // Path 1: TTL-based expiry
+    const r1 = db.prepare(`
       UPDATE memories
       SET deleted_at = unixepoch() * 1000
       WHERE deleted_at IS NULL AND expires_at IS NOT NULL AND expires_at < unixepoch() * 1000
     `).run()
-    if (info.changes > 0) log(`Expired ${info.changes} memories`)
-    return info.changes
+    // Path 2: superseded_by soft-delete (migration 001)
+    const r2 = db.prepare(`
+      UPDATE memories
+      SET deleted_at = unixepoch() * 1000
+      WHERE deleted_at IS NULL AND superseded_by IS NOT NULL
+    `).run()
+    if (r1.changes > 0 || r2.changes > 0) {
+      log(`Expired: ${r1.changes} ttl + ${r2.changes} superseded`)
+    }
+    return r1.changes + r2.changes
   } catch { return 0 }
 }
 
@@ -1065,6 +1197,74 @@ export function promoteMemories() {
     }
   } catch (e) {
     log(`promoteMemories failed: ${e.message}`)
+  }
+}
+
+// migration 003: power-law decay cycle
+//   w(t) = (1 + t/tau)^(-b_eff)
+//   tau    = 24h (configurable)
+//   b_base = 0.7
+//   b_eff  = b_base / (1 + importance / 10)
+//     importance=1  -> b_eff ~ 0.64 (decays faster)
+//     importance=10 -> b_eff ~ 0.35 (decays slower)
+//
+//   final = min(1.0, w * (1 + min(10, access_count) * 0.3))
+//     access_count is capped at 10 to prevent runaway boost on hot records.
+//
+// Intended to run alongside expireMemories / promoteMemories on a periodic
+// schedule (e.g. setInterval in a maintenance daemon).
+//
+// Options:
+//   { tauHours = 24, bBase = 0.7, dryRun = false }
+// Returns:
+//   { processed, distribution: {high, mid, low, cold}, sample? }
+export function runDecayCycle(opts = {}) {
+  const { tauHours = 24, bBase = 0.7, dryRun = false } = opts
+  const db = getDb()
+  const now = Date.now()
+  const tauMs = tauHours * 3600_000
+  let processed = 0
+  const distribution = { high: 0, mid: 0, low: 0, cold: 0 }  // >=0.7 / 0.3-0.7 / 0.1-0.3 / <0.1
+  const sample = []
+
+  try {
+    const rows = db.prepare(`
+      SELECT rowid, importance, access_count, created_at
+      FROM memories
+      WHERE deleted_at IS NULL AND superseded_by IS NULL
+    `).all()
+
+    const items = rows.map(r => {
+      const t = Math.max(0, now - r.created_at)
+      const importance = r.importance || 5
+      const bEff = bBase / (1 + importance / 10)
+      const w = Math.pow(1 + t / tauMs, -bEff)
+      const reuseBoost = 1 + Math.min(10, r.access_count || 0) * 0.3
+      const score = Math.min(1.0, w * reuseBoost)
+      if (score >= 0.7) distribution.high++
+      else if (score >= 0.3) distribution.mid++
+      else if (score >= 0.1) distribution.low++
+      else distribution.cold++
+      return { rowid: r.rowid, score }
+    })
+
+    if (dryRun) {
+      const stride = Math.max(1, Math.floor(items.length / 10))
+      for (let i = 0; i < items.length; i += stride) sample.push(items[i])
+      return { processed: items.length, distribution, sample, dryRun: true }
+    }
+
+    const updateStmt = db.prepare(`UPDATE memories SET decay_score = ? WHERE rowid = ?`)
+    const tx = db.transaction((batch) => {
+      for (const it of batch) updateStmt.run(it.score, it.rowid)
+    })
+    tx(items)
+    processed = items.length
+    log(`runDecayCycle: ${processed} memories updated (high=${distribution.high} mid=${distribution.mid} low=${distribution.low} cold=${distribution.cold})`)
+    return { processed, distribution }
+  } catch (e) {
+    log(`runDecayCycle failed: ${e.message}`)
+    return { processed, distribution, error: e.message }
   }
 }
 
