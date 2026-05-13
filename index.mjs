@@ -256,6 +256,37 @@ export function initMemory() {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_miss_created ON search_misses(created_at DESC)`)
   } catch {}
 
+  // [CHINATSU-PRIVATE · 千夏私有功能，社区分享时剥离]
+  // recall_log: per-call recall stream for per-prompt utilization monitoring
+  // access_count is a counter (cumulative); recall_log is a time-series.
+  // Answers questions like: daily recall rate / caller distribution / per-prompt hit
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS recall_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        source TEXT NOT NULL DEFAULT 'unknown',
+        session_id TEXT,
+        query TEXT,
+        hit_ids TEXT,
+        hit_count INTEGER NOT NULL DEFAULT 0,
+        duration_ms INTEGER,
+        filter_level TEXT,
+        filter_min_importance INTEGER,
+        query_path TEXT NOT NULL DEFAULT 'sync'
+      )
+    `)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_recall_log_ts ON recall_log(ts DESC)`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_recall_log_source ON recall_log(source, ts DESC)`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_recall_log_session ON recall_log(session_id, ts DESC) WHERE session_id IS NOT NULL`)
+  } catch {}
+
+  // [CHINATSU-PRIVATE] final_hit_count: distinguish raw candidate pool (hit_count)
+  // vs post-filter真注入数 (final_hit_count). Written via --update-recall-log fire-and-forget.
+  try {
+    db.exec(`ALTER TABLE recall_log ADD COLUMN final_hit_count INTEGER`)
+  } catch {}  // already exists
+
   // Migration: memories.source CHECK constraint add 'compression'
   // SQLite doesn't support ALTER CHECK -> check if current CHECK includes 'compression', rebuild if not
   try {
@@ -863,7 +894,51 @@ export function recallMemories(opts = {}) {
     } catch {}
   }
 
+  // [CHINATSU-PRIVATE] recall_log instrumentation
+  // _internal=true: skip (hybrid internal FTS path; outer hybrid logs once at exit)
+  if (!opts._internal) {
+    const recallLogId = logRecall({
+      source: opts._source || 'unknown',
+      sessionId: opts._sessionId || null,
+      query: queryText,
+      hitIds: result.map(r => r.rowid),
+      durationMs: Date.now() - now,
+      filterLevel: opts._filterLevel || null,
+      minImportance: opts._minImportance || null,
+      queryPath: 'sync',
+    })
+    if (opts._out && typeof opts._out === 'object') opts._out.recallLogId = recallLogId
+  }
+
   return result
+}
+
+// [CHINATSU-PRIVATE] recall_log INSERT helper
+// 2026-05-05 add — finer-grained than access_count, for per-prompt utilization analysis
+// 2026-05-06 fix — returns lastInsertRowid (recall_log_id) so CLI can pass it to hook for final_hit_count update
+function logRecall({ source, sessionId, query, hitIds, durationMs, filterLevel, minImportance, queryPath }) {
+  try {
+    const db = getDb()
+    const result = db.prepare(`
+      INSERT INTO recall_log (ts, source, session_id, query, hit_ids, hit_count, duration_ms, filter_level, filter_min_importance, query_path)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      Date.now(),
+      source || 'unknown',
+      sessionId || null,
+      (query || '').slice(0, 200),
+      JSON.stringify(Array.isArray(hitIds) ? hitIds.slice(0, 20) : []),
+      Array.isArray(hitIds) ? hitIds.length : 0,
+      durationMs || 0,
+      filterLevel || null,
+      minImportance == null ? null : minImportance,
+      queryPath || 'sync',
+    )
+    return Number(result.lastInsertRowid)
+  } catch (e) {
+    try { process.stderr.write(`[recall_log INSERT failed] ${e.message}\n`) } catch {}
+    return null
+  }
 }
 
 // ── Hybrid Retrieval: FTS5 + Vector + RRF Fusion ────────────
@@ -989,6 +1064,20 @@ export async function recallMemoriesHybrid(opts = {}) {
     } catch {}
   }
 
+  // [CHINATSU-PRIVATE] recall_log instrumentation (hybrid full path exit;
+  // fallback path already logged by recallMemories itself)
+  const recallLogId = logRecall({
+    source: opts._source || 'unknown',
+    sessionId: opts._sessionId || null,
+    query: queryText,
+    hitIds: result.map(r => r.rowid),
+    durationMs: Date.now() - now,
+    filterLevel: opts._filterLevel || null,
+    minImportance: opts._minImportance || null,
+    queryPath: 'hybrid',
+  })
+  if (opts._out && typeof opts._out === 'object') opts._out.recallLogId = recallLogId
+
   return result
 }
 
@@ -1102,14 +1191,16 @@ export function searchConversations(queryText, opts = {}) {
  * @param {number} [opts.memoryLimit] - number of memories to recall
  * @returns {Promise<string>} formatted memory context (empty string if none)
  */
+// [CHINATSU-PRIVATE] _source/_sessionId in opts get透传 to recall_log instrumentation (default 'context-builder')
 export async function buildMemoryContext(opts = {}) {
-  const { query: queryText, chatId, memoryLimit = 8 } = opts
+  const { query: queryText, chatId, memoryLimit = 8, _source, _sessionId } = opts
   const sections = []
 
   // 1. Relevant memories (use hybrid when query available; inject high-importance base memories otherwise)
+  const ctxSource = _source || 'context-builder'
   const memories = queryText
-    ? await recallMemoriesHybrid({ query: queryText, limit: memoryLimit, minImportance: 3 })
-    : recallMemories({ limit: memoryLimit, minImportance: 7 })
+    ? await recallMemoriesHybrid({ query: queryText, limit: memoryLimit, minImportance: 3, _source: ctxSource, _sessionId })
+    : recallMemories({ limit: memoryLimit, minImportance: 7, _source: ctxSource, _sessionId })
   if (memories.length > 0) {
     const memLines = memories.map(m => {
       const prefix = { permanent: '[PIN]', long_term: '[LT]', short_term: '[ST]', working: '[W]' }[m.memory_type] || '[?]'
@@ -1789,15 +1880,59 @@ if (_isMain) {
       if (ctx) process.stdout.write(ctx + '\n')
 
     } else if (getFlag('--recall') !== null) {
+      // [CHINATSU-PRIVATE] enhanced --recall: hybrid path + filter + JSON output + recall_log instrumentation
+      // --format json: structured output for hooks (rowid/level/summary/tags/score, includes recall_log_id)
+      // --min-importance N: filter importance >= N
+      // --level lvl1,lvl2: filter memory_level in CSV set
+      // --source <name>: recall_log instrumentation caller (mcp/cli/prompt-recall-hook/...), default 'cli'
+      // --session-id <id>: CC session id, used by hook for per-prompt aggregation
       const query = getFlag('--recall') || ''
       const limit = parseInt(getFlag('--limit') || '10', 10)
-      const memories = recallMemories({ query, limit })
-      if (memories.length === 0) {
-        process.stdout.write('(no relevant memories found)\n')
+      const minImportance = parseInt(getFlag('--min-importance') || '0', 10)
+      const levelArg = getFlag('--level') || ''
+      const levelFilter = levelArg ? levelArg.split(',').map(s => s.trim()).filter(Boolean) : []
+      const format = getFlag('--format') || 'text'
+      const source = getFlag('--source') || 'cli'
+      const sessionId = getFlag('--session-id') || null
+
+      const candidatePoolSize = (minImportance > 0 || levelFilter.length > 0) ? Math.max(limit * 3, 30) : limit
+      const recallOut = {}
+      // hybrid path: FTS5 + embedding semantic + RRF (auto fallback to sync when vec/embedding unavailable)
+      let memories = await recallMemoriesHybrid({
+        query,
+        limit: candidatePoolSize,
+        _source: source,
+        _sessionId: sessionId,
+        _filterLevel: levelFilter.length ? levelFilter.join(',') : null,
+        _minImportance: minImportance > 0 ? minImportance : null,
+        _out: recallOut,
+      })
+
+      if (minImportance > 0) memories = memories.filter(m => (m.importance || 0) >= minImportance)
+      if (levelFilter.length > 0) memories = memories.filter(m => levelFilter.includes(m.memory_level))
+      memories = memories.slice(0, limit)
+
+      if (format === 'json') {
+        const hits = memories.map(m => ({
+          id: m.rowid,
+          content: m.content,
+          summary: m.summary || null,
+          importance: m.importance,
+          memory_level: m.memory_level,
+          memory_type: m.memory_type,
+          tags: Array.isArray(m.tags) ? m.tags : [],
+          score: typeof m.score === 'number' ? m.score : null,
+          created_at: m.created_at,
+        }))
+        process.stdout.write(JSON.stringify({ hits, count: hits.length, recall_log_id: recallOut.recallLogId || null }) + '\n')
       } else {
-        for (const m of memories) {
-          const date = new Date(m.created_at).toLocaleDateString()
-          process.stdout.write(`[${m.importance}* ${m.memory_type} ${date}] ${m.content.slice(0, 120)}\n`)
+        if (memories.length === 0) {
+          process.stdout.write('(no relevant memories found)\n')
+        } else {
+          for (const m of memories) {
+            const date = new Date(m.created_at).toLocaleDateString()
+            process.stdout.write(`[${m.importance}* ${m.memory_type} ${date}] ${m.content.slice(0, 120)}\n`)
+          }
         }
       }
 
@@ -1850,6 +1985,146 @@ if (_isMain) {
         tags: ['compact', 'auto-summary', 'session-transcript'],
       })
       process.stdout.write(`stored compact summary: memory id ${id}\n`)
+
+    } else if (getFlag('--update-recall-log') !== null) {
+      // [CHINATSU-PRIVATE] post-update recall_log.final_hit_count (hook writes真注入数 after filtering)
+      // Usage: node index.mjs --update-recall-log <id> --final-count <n>
+      // Design: hook 1st spawn gets recall_log_id + candidates → post-filter computes final → 2nd spawn writes back async
+      const idStr = getFlag('--update-recall-log') || ''
+      const id = parseInt(idStr, 10)
+      const finalCount = parseInt(getFlag('--final-count') || '-1', 10)
+      if (!Number.isFinite(id) || id <= 0 || finalCount < 0) {
+        process.stderr.write(`Error: --update-recall-log <id> --final-count <n> (got id=${idStr} count=${finalCount})\n`)
+        process.exit(1)
+      }
+      const db = getDb()
+      const r = db.prepare(`UPDATE recall_log SET final_hit_count = ? WHERE id = ?`).run(finalCount, id)
+      process.stdout.write(`updated ${r.changes} row(s)\n`)
+
+    } else if (hasFlag('--recall-stats')) {
+      // [CHINATSU-PRIVATE] recall_log stats: per-call utilization analysis over last N days
+      // Usage: node index.mjs --recall-stats [--days 7] [--format json]
+      // Answers questions that access_count cannot: time window / caller / per-prompt
+      const days = parseInt(getFlag('--days') || '7', 10)
+      const format = getFlag('--format') || 'text'
+      const since = Date.now() - days * 86400_000
+      const db = getDb()
+
+      const total = db.prepare(`SELECT COUNT(*) c FROM recall_log WHERE ts > ?`).get(since).c
+      const bySource = db.prepare(`
+        SELECT source,
+               COUNT(*) calls,
+               SUM(hit_count) total_hits,
+               AVG(hit_count) avg_hits,
+               SUM(CASE WHEN hit_count = 0 THEN 1 ELSE 0 END) zero_hits,
+               AVG(duration_ms) avg_dur_ms,
+               MAX(duration_ms) max_dur_ms
+        FROM recall_log WHERE ts > ?
+        GROUP BY source
+        ORDER BY calls DESC
+      `).all(since)
+      const byPath = db.prepare(`
+        SELECT query_path, COUNT(*) calls, AVG(duration_ms) avg_dur_ms
+        FROM recall_log WHERE ts > ?
+        GROUP BY query_path
+      `).all(since)
+      const sessions = db.prepare(`
+        SELECT session_id, COUNT(*) recalls
+        FROM recall_log
+        WHERE ts > ? AND session_id IS NOT NULL
+        GROUP BY session_id
+      `).all(since)
+      const sessionCount = sessions.length
+      const totalSessionRecalls = sessions.reduce((s, r) => s + r.recalls, 0)
+      const avgRecallsPerSession = sessionCount > 0 ? totalSessionRecalls / sessionCount : 0
+      const noSession = total - totalSessionRecalls
+
+      const hitBuckets = db.prepare(`
+        SELECT
+          SUM(CASE WHEN hit_count = 0 THEN 1 ELSE 0 END) zero,
+          SUM(CASE WHEN hit_count BETWEEN 1 AND 2 THEN 1 ELSE 0 END) one_to_two,
+          SUM(CASE WHEN hit_count BETWEEN 3 AND 9 THEN 1 ELSE 0 END) three_to_nine,
+          SUM(CASE WHEN hit_count >= 10 THEN 1 ELSE 0 END) ten_plus
+        FROM recall_log WHERE ts > ?
+      `).get(since)
+
+      const dupQueries = db.prepare(`
+        SELECT query, COUNT(*) freq, SUM(hit_count) total_hits
+        FROM recall_log WHERE ts > ? AND query IS NOT NULL AND length(query) > 0
+        GROUP BY query
+        HAVING freq >= 3
+        ORDER BY freq DESC
+        LIMIT 10
+      `).all(since)
+
+      if (format === 'json') {
+        process.stdout.write(JSON.stringify({
+          window_days: days, total_calls: total,
+          by_source: bySource, by_path: byPath,
+          session_count: sessionCount, avg_recalls_per_session: avgRecallsPerSession,
+          recalls_without_session: noSession,
+          hit_buckets: hitBuckets,
+          duplicate_queries: dupQueries,
+        }, null, 2) + '\n')
+      } else {
+        process.stdout.write(`\n## recall_log stats · last ${days} days\n\n`)
+        process.stdout.write(`total calls: ${total}\n`)
+        process.stdout.write(`distinct sessions: ${sessionCount} (hook paths only, has session_id)\n`)
+        process.stdout.write(`calls without session_id (mcp/cli/context-builder): ${noSession}\n`)
+        process.stdout.write(`avg recalls / session: ${avgRecallsPerSession.toFixed(2)}\n\n`)
+        process.stdout.write('### by source\n')
+        for (const s of bySource) {
+          process.stdout.write(`  ${s.source.padEnd(22)} | calls=${s.calls.toString().padStart(5)} | avg_hits=${s.avg_hits.toFixed(2)} | zero=${s.zero_hits} | avg_dur=${s.avg_dur_ms ? s.avg_dur_ms.toFixed(0) + 'ms' : 'n/a'}\n`)
+        }
+        process.stdout.write('\n### by path\n')
+        for (const p of byPath) process.stdout.write(`  ${p.query_path.padEnd(8)} | calls=${p.calls} | avg_dur=${p.avg_dur_ms ? p.avg_dur_ms.toFixed(0) + 'ms' : 'n/a'}\n`)
+        process.stdout.write('\n### hit distribution\n')
+        process.stdout.write(`  zero=${hitBuckets.zero} | 1-2=${hitBuckets.one_to_two} | 3-9=${hitBuckets.three_to_nine} | 10+=${hitBuckets.ten_plus}\n`)
+        if (dupQueries.length > 0) {
+          process.stdout.write('\n### duplicate query top (freq >= 3, consider store/inject)\n')
+          for (const q of dupQueries) process.stdout.write(`  freq=${q.freq.toString().padStart(3)} | total_hits=${q.total_hits} | "${q.query.slice(0, 80)}"\n`)
+        }
+        process.stdout.write('\n')
+      }
+
+    } else if (getFlag('--recall-strict') !== null) {
+      // [CHINATSU-PRIVATE] strict keyword match: require content/summary/tags to真含 keyword substring
+      // For tool-recall-pre hook: avoid FTS composite scoring lifting unrelated meta with "param/usage" keywords
+      const keyword = getFlag('--recall-strict') || ''
+      const limit = parseInt(getFlag('--limit') || '5', 10)
+      const source = getFlag('--source') || 'cli-strict'
+      const sessionId = getFlag('--session-id') || null
+      const startTs = Date.now()
+      if (!keyword || keyword.length < 2) {
+        process.stdout.write('(no relevant memories)\n')
+        logRecall({ source, sessionId, query: keyword, hitIds: [], durationMs: Date.now() - startTs, queryPath: 'strict' })
+        return
+      }
+      const db = getDb()
+      const like = '%' + keyword.replace(/[%_]/g, '\\$&') + '%'
+      const rows = db.prepare(`
+        SELECT rowid, content, summary, importance, memory_type, created_at
+        FROM memories
+        WHERE deleted_at IS NULL
+          AND memory_level IN ('meta_knowledge', 'semi_abstract')
+          AND (content LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')
+        ORDER BY importance DESC, created_at DESC
+        LIMIT ?
+      `).all(like, like, like, limit)
+      if (rows.length === 0) {
+        process.stdout.write('(no relevant memories)\n')
+      } else {
+        for (const m of rows) {
+          const date = new Date(m.created_at).toLocaleDateString()
+          process.stdout.write(`[${m.importance}* ${m.memory_type} ${date}] ${m.content.slice(0, 200)}\n`)
+        }
+      }
+      logRecall({
+        source, sessionId, query: keyword,
+        hitIds: rows.map(r => r.rowid),
+        durationMs: Date.now() - startTs,
+        queryPath: 'strict',
+      })
 
     } else if (getFlag('--compress') !== null) {
       const chatId = getFlag('--compress')

@@ -228,3 +228,29 @@ CREATE TABLE IF NOT EXISTS episodes (
 
 CREATE INDEX IF NOT EXISTS idx_ep_type ON episodes(event_type) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_ep_memory ON episodes(memory_id);
+
+-- ── 6. Recall Log (per-call recall stream) ──────────────────
+-- [CHINATSU-PRIVATE · strip for community release]
+-- Per-call recall instrumentation; complements memories.access_count (cumulative)
+-- with time-series data for per-prompt utilization / caller distribution analysis.
+-- See migrations/005-formalize-recall-log.sql for migration source of truth.
+CREATE TABLE IF NOT EXISTS recall_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  source TEXT NOT NULL DEFAULT 'unknown',
+  session_id TEXT,
+  query TEXT,
+  hit_ids TEXT,
+  hit_count INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER,
+  filter_level TEXT,
+  filter_min_importance INTEGER,
+  query_path TEXT NOT NULL DEFAULT 'sync',
+  final_hit_count INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_recall_log_ts ON recall_log(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_recall_log_source ON recall_log(source, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_recall_log_session
+  ON recall_log(session_id, ts DESC)
+  WHERE session_id IS NOT NULL;
