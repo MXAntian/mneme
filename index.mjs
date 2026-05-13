@@ -25,7 +25,16 @@ import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const DB_PATH = process.env.TOKENMEM_DB_PATH || resolve(__dirname, 'tokenmem.db')
+// Path resolution order (v2.1.2):
+//   1. $TOKENMEM_DB_PATH if set (explicit override)
+//   2. Existing engram.db beside this module (back-compat for users coming from
+//      the pre-rename era — silent migration would create a split-brain second
+//      DB; we'd rather keep using the populated one)
+//   3. tokenmem.db (default for fresh installs)
+const DB_PATH = process.env.TOKENMEM_DB_PATH
+  || (existsSync(resolve(__dirname, 'engram.db'))
+        ? resolve(__dirname, 'engram.db')
+        : resolve(__dirname, 'tokenmem.db'))
 const SCHEMA_PATH = resolve(__dirname, 'schema.sql')
 // wangfenjin/simple Chinese tokenizer extension (optional)
 const SIMPLE_EXT_DIR = resolve(__dirname, 'lib/libsimple-windows-x64')
