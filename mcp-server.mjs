@@ -12,6 +12,7 @@ import { z } from 'zod'
 import {
   initMemory,
   recallMemories,
+  getMemoriesByIds,
   storeMemory,
   storeMemoryAsync,
   buildMemoryContext,
@@ -83,6 +84,28 @@ server.tool(
     }
 
     return { content: [{ type: 'text', text: `Stored memory (id: ${id}, importance: ${importance}, type: ${memory_type}, level: ${memory_level})` }] }
+  }
+)
+
+// ── Tool: recall_by_id ──────────────────────────────────────
+server.tool(
+  'recall_by_id',
+  'Retrieve specific memories by their rowid(s). Use when you have an id from a previous recall_memory hit and want the full content (not the truncated preview), when you need to inspect a memory before supersede/merge/audit operations, or when following prior_versions[].source_rowid pointers. Returns raw content + summary + full metadata with no truncation; does NOT increment access_count.',
+  {
+    ids: z.array(z.union([z.number(), z.string()])).describe('Memory rowid(s) to fetch (numbers or numeric strings)'),
+    include_deleted: z.boolean().optional().default(false).describe('Include soft-deleted memories. Default false. Use true for audit / prior_versions chain inspection.'),
+  },
+  async ({ ids, include_deleted = false }) => {
+    const rows = getMemoriesByIds(ids, { includeDeleted: include_deleted })
+    if (rows.length === 0) {
+      return { content: [{ type: 'text', text: '(no memories found for the given ids)' }] }
+    }
+    const text = rows.map(r => {
+      const tags = r.tags?.length ? ` [${r.tags.join(', ')}]` : ''
+      const priors = r.prior_versions?.length ? ` (${r.prior_versions.length} prior versions)` : ''
+      return `[id:${r.rowid} ★${r.importance} ${r.memory_type} ${r.memory_level}]${tags}${priors}\n${r.summary ? '📌 ' + r.summary + '\n' : ''}${r.content}`
+    }).join('\n\n---\n\n')
+    return { content: [{ type: 'text', text }] }
   }
 )
 

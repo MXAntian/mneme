@@ -1426,6 +1426,34 @@ export function runDecayCycle(opts = {}) {
   }
 }
 
+// migration 004 follow-up (v2.2): inspect memories by rowid(s) — no recall scoring,
+// no access_count bump, raw fetch. Use cases:
+//   - caller got [id:N] from recall_memory and wants full content (no preview truncation)
+//   - supersede flow: preview old rowids before committing
+//   - follow prior_versions[].source_rowid for audit / chain inspection
+export function getMemoriesByIds(ids, opts = {}) {
+  if (!Array.isArray(ids) || ids.length === 0) return []
+  const { includeDeleted = false } = opts
+  const db = getDb()
+  // Accept string or number; rowid is INTEGER but storeMemory returns String(lastInsertRowid)
+  const normalized = ids.map(String).filter(s => /^\d+$/.test(s))
+  if (normalized.length === 0) return []
+  const placeholders = normalized.map(() => '?').join(',')
+  const deletedClause = includeDeleted ? '' : ' AND deleted_at IS NULL'
+  const rows = db.prepare(`
+    SELECT rowid, * FROM memories
+    WHERE rowid IN (${placeholders})${deletedClause}
+  `).all(...normalized)
+  // Preserve caller's input order (callers expect 1:1 correspondence)
+  const byId = new Map(rows.map(r => [String(r.rowid), r]))
+  return normalized.map(id => byId.get(id)).filter(Boolean).map(r => ({
+    ...r,
+    tags: safeJsonParse(r.tags, []),
+    metadata: safeJsonParse(r.metadata, {}),
+    prior_versions: safeJsonParse(r.prior_versions, []),
+  }))
+}
+
 // ── Goal Management ─────────────────────────────────────────
 
 export function upsertGoal(goal) {
@@ -1933,6 +1961,26 @@ if (_isMain) {
             const date = new Date(m.created_at).toLocaleDateString()
             process.stdout.write(`[${m.importance}* ${m.memory_type} ${date}] ${m.content.slice(0, 120)}\n`)
           }
+        }
+      }
+
+    } else if (getFlag('--get-by-id') !== null || getFlag('--get-by-ids') !== null) {
+      const idsRaw = getFlag('--get-by-id') || getFlag('--get-by-ids')
+      const ids = idsRaw.split(',').map(s => s.trim()).filter(Boolean)
+      const includeDeleted = process.argv.includes('--include-deleted')
+      const format = getFlag('--format') || 'text'
+      const rows = getMemoriesByIds(ids, { includeDeleted })
+      if (format === 'json') {
+        process.stdout.write(JSON.stringify(rows, null, 2) + '\n')
+      } else if (rows.length === 0) {
+        process.stdout.write('(no memories found for the given ids)\n')
+      } else {
+        for (const r of rows) {
+          const tags = r.tags?.length ? ` [${r.tags.join(', ')}]` : ''
+          const priors = r.prior_versions?.length ? ` (${r.prior_versions.length} prior versions)` : ''
+          process.stdout.write(`[id:${r.rowid} ★${r.importance} ${r.memory_type} ${r.memory_level}]${tags}${priors}\n`)
+          if (r.summary) process.stdout.write(`  📌 ${r.summary}\n`)
+          process.stdout.write(`${r.content}\n\n`)
         }
       }
 
