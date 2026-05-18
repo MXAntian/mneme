@@ -1192,15 +1192,26 @@ export function searchConversations(queryText, opts = {}) {
  * @returns {Promise<string>} formatted memory context (empty string if none)
  */
 // [CHINATSU-PRIVATE] _source/_sessionId in opts get透传 to recall_log instrumentation (default 'context-builder')
+// 2026-05-18 #008: inline final_hit_count UPDATE — context-builder/mcp 路径无后置过滤，
+// 注入数 = recall 命中数，写入 final_hit_count 让 recall-stats 数据不偏斜
 export async function buildMemoryContext(opts = {}) {
   const { query: queryText, chatId, memoryLimit = 8, _source, _sessionId } = opts
   const sections = []
 
   // 1. Relevant memories (use hybrid when query available; inject high-importance base memories otherwise)
   const ctxSource = _source || 'context-builder'
+  const recallOut = {}  // [CHINATSU-PRIVATE] 接 recallLogId 用于 inline final 写入
   const memories = queryText
-    ? await recallMemoriesHybrid({ query: queryText, limit: memoryLimit, minImportance: 3, _source: ctxSource, _sessionId })
-    : recallMemories({ limit: memoryLimit, minImportance: 7, _source: ctxSource, _sessionId })
+    ? await recallMemoriesHybrid({ query: queryText, limit: memoryLimit, minImportance: 3, _source: ctxSource, _sessionId, _out: recallOut })
+    : recallMemories({ limit: memoryLimit, minImportance: 7, _source: ctxSource, _sessionId, _out: recallOut })
+
+  // [CHINATSU-PRIVATE] #008 inline UPDATE final_hit_count（buildMemoryContext 无后置过滤，final=memories.length）
+  if (recallOut.recallLogId) {
+    try {
+      getDb().prepare('UPDATE recall_log SET final_hit_count = ? WHERE id = ?')
+        .run(memories.length, recallOut.recallLogId)
+    } catch {}
+  }
   if (memories.length > 0) {
     const memLines = memories.map(m => {
       const prefix = { permanent: '[PIN]', long_term: '[LT]', short_term: '[ST]', working: '[W]' }[m.memory_type] || '[?]'
@@ -2138,20 +2149,26 @@ if (_isMain) {
     } else if (getFlag('--recall-strict') !== null) {
       // [CHINATSU-PRIVATE] strict keyword match: require content/summary/tags to真含 keyword substring
       // For tool-recall-pre hook: avoid FTS composite scoring lifting unrelated meta with "param/usage" keywords
+      // 2026-05-18 #008: 加 --format json 输出含 recall_log_id, hook 可后置 update final_hit_count
       const keyword = getFlag('--recall-strict') || ''
       const limit = parseInt(getFlag('--limit') || '5', 10)
       const source = getFlag('--source') || 'cli-strict'
       const sessionId = getFlag('--session-id') || null
+      const format = getFlag('--format') || 'text'
       const startTs = Date.now()
       if (!keyword || keyword.length < 2) {
-        process.stdout.write('(no relevant memories)\n')
-        logRecall({ source, sessionId, query: keyword, hitIds: [], durationMs: Date.now() - startTs, queryPath: 'strict' })
+        const emptyLogId = logRecall({ source, sessionId, query: keyword, hitIds: [], durationMs: Date.now() - startTs, queryPath: 'strict' })
+        if (format === 'json') {
+          process.stdout.write(JSON.stringify({ hits: [], count: 0, recall_log_id: emptyLogId || null }) + '\n')
+        } else {
+          process.stdout.write('(no relevant memories)\n')
+        }
         return
       }
       const db = getDb()
       const like = '%' + keyword.replace(/[%_]/g, '\\$&') + '%'
       const rows = db.prepare(`
-        SELECT rowid, content, summary, importance, memory_type, created_at
+        SELECT rowid, content, summary, importance, memory_type, created_at, tags, memory_level
         FROM memories
         WHERE deleted_at IS NULL
           AND memory_level IN ('meta_knowledge', 'semi_abstract')
@@ -2159,20 +2176,34 @@ if (_isMain) {
         ORDER BY importance DESC, created_at DESC
         LIMIT ?
       `).all(like, like, like, limit)
-      if (rows.length === 0) {
-        process.stdout.write('(no relevant memories)\n')
-      } else {
-        for (const m of rows) {
-          const date = new Date(m.created_at).toLocaleDateString()
-          process.stdout.write(`[${m.importance}* ${m.memory_type} ${date}] ${m.content.slice(0, 200)}\n`)
-        }
-      }
-      logRecall({
+      const recallLogId = logRecall({
         source, sessionId, query: keyword,
         hitIds: rows.map(r => r.rowid),
         durationMs: Date.now() - startTs,
         queryPath: 'strict',
       })
+      if (format === 'json') {
+        const hits = rows.map(m => ({
+          id: m.rowid,
+          content: m.content,
+          summary: m.summary || null,
+          importance: m.importance,
+          memory_level: m.memory_level,
+          memory_type: m.memory_type,
+          tags: m.tags ? safeJsonParse(m.tags, []) : [],
+          created_at: m.created_at,
+        }))
+        process.stdout.write(JSON.stringify({ hits, count: hits.length, recall_log_id: recallLogId || null }) + '\n')
+      } else {
+        if (rows.length === 0) {
+          process.stdout.write('(no relevant memories)\n')
+        } else {
+          for (const m of rows) {
+            const date = new Date(m.created_at).toLocaleDateString()
+            process.stdout.write(`[${m.importance}* ${m.memory_type} ${date}] ${m.content.slice(0, 200)}\n`)
+          }
+        }
+      }
 
     } else if (getFlag('--compress') !== null) {
       const chatId = getFlag('--compress')
