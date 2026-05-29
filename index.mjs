@@ -22,6 +22,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
+import { createHash } from 'node:crypto'
 
 const require = createRequire(import.meta.url)
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -222,6 +223,20 @@ export function initMemory() {
   } catch {}  // already exists
   try {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_level ON memories(memory_level) WHERE deleted_at IS NULL`)
+  } catch {}
+  // Store-time dedup + event_time (migration 004). Inline so fresh installs get them
+  // without manually applying migrations/004 — storeMemory's dedup path needs content_hash.
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN content_hash TEXT`)
+    log('Migration: added content_hash column')
+  } catch {}  // already exists
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN event_time INTEGER`)
+    log('Migration: added event_time column')
+  } catch {}
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_content_hash ON memories(content_hash, created_at DESC) WHERE content_hash IS NOT NULL AND deleted_at IS NULL`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_event_time ON memories(event_time DESC) WHERE event_time IS NOT NULL AND deleted_at IS NULL`)
   } catch {}
 
   // Vector search virtual table (sqlite-vec)
@@ -472,6 +487,21 @@ export async function recordConversationAsync(msg) {
 
 // ── Memory Storage ──────────────────────────────────────────
 
+// migration 004 (v2.2): 5-min window dedup config
+const DEDUP_WINDOW_MS = 5 * 60_000
+
+// migration 004 (v2.2): event_time accepts ms number, ISO string, or Date object
+function _parseEventTime(v) {
+  if (v == null) return null
+  if (typeof v === 'number' && Number.isFinite(v)) return v
+  if (v instanceof Date) return v.getTime()
+  if (typeof v === 'string') {
+    const ms = Date.parse(v)
+    return Number.isNaN(ms) ? null : ms
+  }
+  return null
+}
+
 /**
  * Store a memory
  * @param {Object} mem
@@ -519,13 +549,47 @@ export function storeMemory(mem) {
     ? mem.supersedes.filter(s => typeof s === 'string' && /^\d+$/.test(s.trim())).map(s => s.trim())
     : []
 
+  // migration 004 (v2.2): content hash + event_time
+  const contentHash = createHash('sha256').update(String(mem.content || '')).digest('hex').slice(0, 16)
+  const eventTime = _parseEventTime(mem.eventTime)
+
+  // migration 004 (v2.2): 5-min window dedup
+  // If the same content was stored within the last DEDUP_WINDOW_MS,
+  // skip INSERT, bump existing row's access_count, return its id.
+  // Avoids retry-store loops bloating the table while preserving the
+  // "told you again" signal via access_count.
+  // Skipped when caller passes supersedes (explicit retraction path takes
+  // precedence) or compressedFrom (compression products are intentionally
+  // new rows even if content overlaps).
+  if (supersedes.length === 0 && compressedFrom.length === 0) {
+    try {
+      const cutoff = now - DEDUP_WINDOW_MS
+      const dup = db.prepare(`
+        SELECT rowid FROM memories
+        WHERE content_hash = ? AND created_at > ?
+          AND deleted_at IS NULL AND superseded_by IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+      `).get(contentHash, cutoff)
+      if (dup) {
+        db.prepare(`UPDATE memories SET access_count = access_count + 1, last_accessed = ? WHERE rowid = ?`)
+          .run(now, dup.rowid)
+        log(`storeMemory: dedup hit -> existing rowid=${dup.rowid} (5-min window, access_count bumped)`)
+        return String(dup.rowid)
+      }
+    } catch (e) {
+      // Dedup is best-effort — fall through to insert if the query fails
+      log(`storeMemory: dedup check failed (continuing to insert): ${e.message}`)
+    }
+  }
+
   try {
     const insertStmt = db.prepare(`
       INSERT INTO memories
         (content, summary, memory_type, category, importance, emotional_impact,
          source, source_id, source_platform, tags, metadata, expires_at,
-         compressed_from, is_compressed, memory_level)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         compressed_from, is_compressed, memory_level, content_hash, event_time)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     const supersedeStmt = db.prepare(
       `UPDATE memories SET superseded_by = ? WHERE rowid = ? AND deleted_at IS NULL AND superseded_by IS NULL`
@@ -557,6 +621,8 @@ export function storeMemory(mem) {
         JSON.stringify(compressedFrom),
         isCompressed,
         memoryLevel,
+        contentHash,    // migration 004 (v2.2)
+        eventTime,      // migration 004 (v2.2)
       )
       newId = info.lastInsertRowid ? String(info.lastInsertRowid) : null
 
@@ -627,6 +693,45 @@ export async function storeMemoryAsync(mem) {
     }
   }
   return id
+}
+
+/**
+ * [2026-05-29 千夏] Self-heal sweep：给缺 content_vector 的活跃记忆补向量。
+ * 堵漏——绕过 storeMemoryAsync 的写入路径（同步 storeMemory / CLI / staging 批处理）
+ * 会让新记忆永久缺向量、对语义召回失明。MCP server 启动时 fire-and-forget 跑一遍，
+ * 把"宕机/降级期间漏写的 NULL 向量"扫掉。幂等（只扫 NULL）、有 cap、维度校验拒绝混维。
+ * @param {number} limit 单次最多补多少条（防一次性打爆 embedding API）
+ * @returns {Promise<{scanned:number, embedded:number, failed:number, skipped?:string}>}
+ */
+export async function embedMissingVectors(limit = 200) {
+  if (!_embeddingConfig) return { scanned: 0, embedded: 0, failed: 0, skipped: 'no_embedding_config' }
+  const db = getDb()
+  const rows = db.prepare(`
+    SELECT rowid, content FROM memories
+    WHERE deleted_at IS NULL AND (content_vector IS NULL OR content_vector = '')
+    ORDER BY importance DESC, created_at DESC
+    LIMIT ?
+  `).all(limit)
+  if (rows.length === 0) return { scanned: 0, embedded: 0, failed: 0 }
+  const dim = _embeddingConfig.dimension
+  const updateStmt = db.prepare(`UPDATE memories SET content_vector = ? WHERE rowid = ?`)
+  let embedded = 0, failed = 0
+  for (const row of rows) {
+    try {
+      const vec = await generateEmbedding(row.content)
+      if (!vec || vec.length !== dim) { failed++; continue }  // 维度不符 → 拒绝写脏向量
+      updateStmt.run(JSON.stringify(vec), row.rowid)
+      if (_vecLoaded) {
+        try {
+          db.prepare(`INSERT OR REPLACE INTO memories_vec(memory_rowid, embedding) VALUES (?, ?)`)
+            .run(BigInt(row.rowid), new Float32Array(vec))
+        } catch (e) { log(`embedMissingVectors: memories_vec insert failed (${row.rowid}): ${e.message}`) }
+      }
+      embedded++
+    } catch (e) { failed++; log(`embedMissingVectors: rowid ${row.rowid} failed: ${e.message}`) }
+  }
+  if (embedded || failed) log(`embedMissingVectors: scanned ${rows.length}, embedded ${embedded}, failed ${failed}`)
+  return { scanned: rows.length, embedded, failed }
 }
 
 // ── Memory Retrieval (Core! AIRI-style composite scoring) ───
@@ -756,7 +861,11 @@ export function recallMemories(opts = {}) {
   const scored = rows.map(row => {
     const ftsScore = row.fts_rank ? Math.min(1, Math.abs(row.fts_rank) / 10) : 0
     const importanceScore = row.importance / 10
-    const age = now - row.created_at
+    // migration 004 (v2.2): age based on event_time when set, else created_at fallback.
+    // Lets temporal queries ("what did I do last June?") match by when the event happened,
+    // not when it was recorded.
+    const effectiveTime = row.event_time != null ? row.event_time : row.created_at
+    const age = now - effectiveTime
     const timeScore = Math.max(0, 1 - age / THIRTY_DAYS_MS)
     const accessScore = Math.min(1, row.access_count / 20)
     const levelWeight = LEVEL_WEIGHT[row.memory_level] || 1.0
@@ -899,7 +1008,9 @@ export async function recallMemoriesHybrid(opts = {}) {
   const merged = Array.from(rrfScores.values()).map(({ row, rrf, sources }) => {
     const levelWeight = LEVEL_WEIGHT[row.memory_level] || 1.0
     const importanceScore = row.importance / 10
-    const age = now - row.created_at
+    // migration 004 (v2.2): age based on event_time when set, else created_at fallback
+    const effectiveTime = row.event_time != null ? row.event_time : row.created_at
+    const age = now - effectiveTime
     const timeScore = Math.max(0, 1 - age / THIRTY_DAYS_MS)
     // migration 003: decay_score multiplier (defaults to 1.0 backward-compatible)
     const decay = (row.decay_score != null) ? row.decay_score : 1.0
@@ -1052,6 +1163,7 @@ export async function buildMemoryContext(opts = {}) {
   const memories = queryText
     ? await recallMemoriesHybrid({ query: queryText, limit: memoryLimit, minImportance: 3 })
     : recallMemories({ limit: memoryLimit, minImportance: 7 })
+
   if (memories.length > 0) {
     const memLines = memories.map(m => {
       const prefix = { permanent: '[PIN]', long_term: '[LT]', short_term: '[ST]', working: '[W]' }[m.memory_type] || '[?]'
@@ -1277,6 +1389,34 @@ export function runDecayCycle(opts = {}) {
   }
 }
 
+// migration 004 follow-up (v2.2): inspect memories by rowid(s) — no recall scoring,
+// no access_count bump, raw fetch. Use cases:
+//   - caller got [id:N] from recall_memory and wants full content (no preview truncation)
+//   - supersede flow: preview old rowids before committing
+//   - follow prior_versions[].source_rowid for audit / chain inspection
+export function getMemoriesByIds(ids, opts = {}) {
+  if (!Array.isArray(ids) || ids.length === 0) return []
+  const { includeDeleted = false } = opts
+  const db = getDb()
+  // Accept string or number; rowid is INTEGER but storeMemory returns String(lastInsertRowid)
+  const normalized = ids.map(String).filter(s => /^\d+$/.test(s))
+  if (normalized.length === 0) return []
+  const placeholders = normalized.map(() => '?').join(',')
+  const deletedClause = includeDeleted ? '' : ' AND deleted_at IS NULL'
+  const rows = db.prepare(`
+    SELECT rowid, * FROM memories
+    WHERE rowid IN (${placeholders})${deletedClause}
+  `).all(...normalized)
+  // Preserve caller's input order (callers expect 1:1 correspondence)
+  const byId = new Map(rows.map(r => [String(r.rowid), r]))
+  return normalized.map(id => byId.get(id)).filter(Boolean).map(r => ({
+    ...r,
+    tags: safeJsonParse(r.tags, []),
+    metadata: safeJsonParse(r.metadata, {}),
+    prior_versions: safeJsonParse(r.prior_versions, []),
+  }))
+}
+
 // ── Goal Management ─────────────────────────────────────────
 
 export function upsertGoal(goal) {
@@ -1314,6 +1454,17 @@ export function getMemoryStats() {
       FROM memories
     `).get()
     const conv = db.prepare(`SELECT COUNT(*) AS count FROM conversations`).get()
+
+    // [2026-05-29 千夏] 向量覆盖率：active 记忆中有 content_vector 的比例。
+    // 用于 /health 主动告警——掉线/漏写时 coverage 会跌，watchdog 据此报警，
+    // 而不是靠人偶然调 memory_stats 才发现"FTS5 only"。
+    const vecCov = db.prepare(`
+      SELECT
+        SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END) AS active,
+        SUM(CASE WHEN deleted_at IS NULL AND content_vector IS NOT NULL AND content_vector != '' THEN 1 ELSE 0 END) AS with_vec
+      FROM memories
+    `).get()
+    const vectorCoverage = vecCov?.active ? +((vecCov.with_vec || 0) / vecCov.active).toFixed(4) : null
     const goals = db.prepare(`
       SELECT COUNT(*) AS count FROM goals WHERE deleted_at IS NULL AND status IN ('planned', 'in_progress')
     `).get()
@@ -1352,6 +1503,7 @@ export function getMemoryStats() {
       deadKnowledge: deadKnowledge?.count || 0,
       recentSearchMisses: recentMisses,
       embeddingConfigured: !!_embeddingConfig,
+      vectorCoverage,
     }
   } catch (e) {
     return { error: e.message }
@@ -1731,15 +1883,69 @@ if (_isMain) {
       if (ctx) process.stdout.write(ctx + '\n')
 
     } else if (getFlag('--recall') !== null) {
+      // --recall <query>: hybrid recall (FTS5 + vector + RRF) with optional filtering + JSON output
+      // --format json: structured output (id/level/summary/tags/score)
+      // --min-importance N: filter importance >= N
+      // --level lvl1,lvl2: filter memory_level in CSV set
       const query = getFlag('--recall') || ''
       const limit = parseInt(getFlag('--limit') || '10', 10)
-      const memories = recallMemories({ query, limit })
-      if (memories.length === 0) {
-        process.stdout.write('(no relevant memories found)\n')
+      const minImportance = parseInt(getFlag('--min-importance') || '0', 10)
+      const levelArg = getFlag('--level') || ''
+      const levelFilter = levelArg ? levelArg.split(',').map(s => s.trim()).filter(Boolean) : []
+      const format = getFlag('--format') || 'text'
+
+      const candidatePoolSize = (minImportance > 0 || levelFilter.length > 0) ? Math.max(limit * 3, 30) : limit
+      // hybrid path: FTS5 + embedding semantic + RRF (auto fallback to sync when vec/embedding unavailable)
+      let memories = await recallMemoriesHybrid({
+        query,
+        limit: candidatePoolSize,
+      })
+
+      if (minImportance > 0) memories = memories.filter(m => (m.importance || 0) >= minImportance)
+      if (levelFilter.length > 0) memories = memories.filter(m => levelFilter.includes(m.memory_level))
+      memories = memories.slice(0, limit)
+
+      if (format === 'json') {
+        const hits = memories.map(m => ({
+          id: m.rowid,
+          content: m.content,
+          summary: m.summary || null,
+          importance: m.importance,
+          memory_level: m.memory_level,
+          memory_type: m.memory_type,
+          tags: Array.isArray(m.tags) ? m.tags : [],
+          score: typeof m.score === 'number' ? m.score : null,
+          created_at: m.created_at,
+        }))
+        process.stdout.write(JSON.stringify({ hits, count: hits.length }) + '\n')
       } else {
-        for (const m of memories) {
-          const date = new Date(m.created_at).toLocaleDateString()
-          process.stdout.write(`[${m.importance}* ${m.memory_type} ${date}] ${m.content.slice(0, 120)}\n`)
+        if (memories.length === 0) {
+          process.stdout.write('(no relevant memories found)\n')
+        } else {
+          for (const m of memories) {
+            const date = new Date(m.created_at).toLocaleDateString()
+            process.stdout.write(`[${m.importance}* ${m.memory_type} ${date}] ${m.content.slice(0, 120)}\n`)
+          }
+        }
+      }
+
+    } else if (getFlag('--get-by-id') !== null || getFlag('--get-by-ids') !== null) {
+      const idsRaw = getFlag('--get-by-id') || getFlag('--get-by-ids')
+      const ids = idsRaw.split(',').map(s => s.trim()).filter(Boolean)
+      const includeDeleted = process.argv.includes('--include-deleted')
+      const format = getFlag('--format') || 'text'
+      const rows = getMemoriesByIds(ids, { includeDeleted })
+      if (format === 'json') {
+        process.stdout.write(JSON.stringify(rows, null, 2) + '\n')
+      } else if (rows.length === 0) {
+        process.stdout.write('(no memories found for the given ids)\n')
+      } else {
+        for (const r of rows) {
+          const tags = r.tags?.length ? ` [${r.tags.join(', ')}]` : ''
+          const priors = r.prior_versions?.length ? ` (${r.prior_versions.length} prior versions)` : ''
+          process.stdout.write(`[id:${r.rowid} ★${r.importance} ${r.memory_type} ${r.memory_level}]${tags}${priors}\n`)
+          if (r.summary) process.stdout.write(`  📌 ${r.summary}\n`)
+          process.stdout.write(`${r.content}\n\n`)
         }
       }
 
