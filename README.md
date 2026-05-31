@@ -1,4 +1,4 @@
-# tokenmem
+# mneme
 
 > **Save 80-90% memory-related token costs.** Persistent long-term memory for AI agents via MCP — on-demand recall instead of always-inject.  
 > **Works with any MCP-compatible agent**: Claude Code, Cursor, Windsurf, Cline, Continue, and more.
@@ -16,9 +16,9 @@ AI agents are stateless. The common fix is injecting a context file on every pro
 | Approach | Token cost per message | 100 messages/day |
 |----------|----------------------|------------------|
 | Pre-injection (always inject) | ~2,000-5,000 tokens | 200K-500K tokens/day |
-| **tokenmem (on-demand)** | **0 tokens (most messages)** | **~20K-50K tokens/day** |
+| **mneme (on-demand)** | **0 tokens (most messages)** | **~20K-50K tokens/day** |
 
-Most prompts don't need historical memory. tokenmem lets the agent decide when to look things up — saving **80-90% of memory-related token costs**.
+Most prompts don't need historical memory. mneme lets the agent decide when to look things up — saving **80-90% of memory-related token costs**.
 
 ---
 
@@ -38,7 +38,7 @@ Inspired by research on cross-context memory reuse (arxiv 2604.14004), memories 
 
 ### sqlite-vec Hybrid Search (FTS5 + KNN + RRF)
 
-When configured with an embedding API, tokenmem now runs **dual-path retrieval**:
+When configured with an embedding API, mneme now runs **dual-path retrieval**:
 
 1. **FTS5 path**: Keyword/lexical matching (fast, exact)
 2. **Vector path**: Semantic matching via sqlite-vec KNN (synonyms, paraphrases)
@@ -61,7 +61,7 @@ Old conversation segments can be automatically compressed into summary memories:
 
 ### Compact Summary Ingestion
 
-tokenmem can ingest summaries from Claude Code's `/compact` feature:
+mneme can ingest summaries from Claude Code's `/compact` feature:
 
 ```bash
 # Triggered by SessionStart hook when source=compact
@@ -182,13 +182,13 @@ Apply in order against your existing `tokenmem.db` (SQLite `ALTER TABLE`). The s
 
 ## Why MCP Makes This Universal
 
-tokenmem is a standard **MCP server** using stdio transport. Any AI agent or IDE that supports the [Model Context Protocol](https://modelcontextprotocol.io/) can connect to it — no code changes needed.
+mneme is a standard **MCP server** using stdio transport. Any AI agent or IDE that supports the [Model Context Protocol](https://modelcontextprotocol.io/) can connect to it — no code changes needed.
 
 **Tested with:**
 
 | Agent | Setup |
 |-------|-------|
-| Claude Code | `claude mcp add --scope user tokenmem -- node /path/to/mcp-server.mjs` |
+| Claude Code | `claude mcp add --scope user mneme -- node /path/to/mcp-server.mjs` |
 | Cursor | Add to `.cursor/mcp.json` |
 | Windsurf | Add to MCP server config |
 | Cline / Continue | Add to MCP settings |
@@ -259,13 +259,13 @@ For enhanced functionality, you can add these SQLite extensions (place in `lib/`
 - **[sqlite-vec](https://github.com/asg017/sqlite-vec)**: KNN vector search for hybrid retrieval
 - **[wangfenjin/simple](https://github.com/wangfenjin/simple)**: Chinese word-level tokenization
 
-Both are optional — tokenmem works fully with just FTS5 out of the box.
+Both are optional — mneme works fully with just FTS5 out of the box.
 
 ### Install
 
 ```bash
-git clone https://github.com/MXAntian/tokenmem-better-memory-save-tokens.git
-cd tokenmem-better-memory-save-tokens
+git clone https://github.com/MXAntian/mneme.git
+cd mneme
 npm install
 ```
 
@@ -293,14 +293,14 @@ node index.mjs --stats
 
 **Claude Code:**
 ```bash
-claude mcp add --scope user tokenmem -- node /absolute/path/to/mcp-server.mjs
+claude mcp add --scope user mneme -- node /absolute/path/to/mcp-server.mjs
 ```
 
 **Cursor / Windsurf / Other MCP clients:**
 ```json
 {
   "mcpServers": {
-    "tokenmem": {
+    "mneme": {
       "command": "node",
       "args": ["/absolute/path/to/mcp-server.mjs"]
     }
@@ -313,9 +313,9 @@ claude mcp add --scope user tokenmem -- node /absolute/path/to/mcp-server.mjs
 Add to your agent's system instructions (e.g., `CLAUDE.md`, `.cursorrules`, etc.):
 
 ```markdown
-## Memory System (tokenmem MCP)
+## Memory System (mneme MCP)
 
-You have access to a persistent memory database via the `tokenmem` MCP server:
+You have access to a persistent memory database via the `mneme` MCP server:
 - `recall_memory(query, limit?, category?)` — retrieve relevant memories
 - `store_memory(content, summary?, importance?, memory_type?, memory_level?, category?, tags?)` — store important info
 - `memory_stats()` — view statistics
@@ -346,7 +346,7 @@ Distill experiences into reusable patterns whenever possible.
 
 ## CLI Usage
 
-tokenmem also works as a standalone CLI tool — useful for hooks, scripts, and debugging:
+mneme also works as a standalone CLI tool — useful for hooks, scripts, and debugging:
 
 ```bash
 # Check stats
@@ -392,7 +392,7 @@ Imports Claude Code's auto-memory `.md` files (`~/.claude/projects/*/memory/*.md
 ## File Structure
 
 ```
-tokenmem/
+mneme/
 ├── mcp-server.mjs              # MCP server entry point (stdio transport)
 ├── index.mjs                   # Core engine: store, recall, hybrid search, compression, decay
 ├── schema.sql                  # SQLite schema (memories, conversations, FTS5, goals)
