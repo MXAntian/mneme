@@ -1,4 +1,4 @@
-# tokenmem
+# mneme
 
 > **节省 80-90% 的记忆相关 token 开销。** 给 AI Agent 用的 MCP 长期记忆系统——按需召回，而不是每次注入。
 > **兼容所有 MCP 客户端**：Claude Code、Cursor、Windsurf、Cline、Continue 等等。
@@ -16,9 +16,9 @@ AI Agent 本质上是无状态的。常见做法是在每次 prompt 里注入一
 | 方案 | 每条消息 token | 每天 100 条消息 |
 |------|--------------------|------------------|
 | 预注入（总是注入） | ~2,000-5,000 tokens | 200K-500K tokens/天 |
-| **tokenmem（按需召回）** | **0 tokens（多数消息）** | **~20K-50K tokens/天** |
+| **mneme（按需召回）** | **0 tokens（多数消息）** | **~20K-50K tokens/天** |
 
-绝大多数 prompt 根本不需要历史记忆。tokenmem 让 Agent 自己决定何时查询——**省下 80-90% 的记忆相关 token 成本**。
+绝大多数 prompt 根本不需要历史记忆。mneme 让 Agent 自己决定何时查询——**省下 80-90% 的记忆相关 token 成本**。
 
 ---
 
@@ -38,7 +38,7 @@ AI Agent 本质上是无状态的。常见做法是在每次 prompt 里注入一
 
 ### sqlite-vec 混合检索（FTS5 + KNN + RRF）
 
-配置 embedding API 后，tokenmem 跑**双路检索**：
+配置 embedding API 后，mneme 跑**双路检索**：
 
 1. **FTS5 路径**：关键词/词法匹配（快、精确）
 2. **向量路径**：通过 sqlite-vec KNN 做语义匹配（同义词、改写）
@@ -61,7 +61,7 @@ AI Agent 本质上是无状态的。常见做法是在每次 prompt 里注入一
 
 ### Compact 摘要导入
 
-tokenmem 可以从 Claude Code 的 `/compact` 功能读入摘要：
+mneme 可以从 Claude Code 的 `/compact` 功能读入摘要：
 
 ```bash
 # 由 SessionStart hook 在 source=compact 时触发
@@ -182,13 +182,13 @@ migrations/
 
 ## 为什么用 MCP 让它通用
 
-tokenmem 是标准 **MCP server**（stdio 传输）。任何支持 [Model Context Protocol](https://modelcontextprotocol.io/) 的 AI Agent 或 IDE 都能直连——无需改代码。
+mneme 是标准 **MCP server**（stdio 传输）。任何支持 [Model Context Protocol](https://modelcontextprotocol.io/) 的 AI Agent 或 IDE 都能直连——无需改代码。
 
 **测试通过：**
 
 | Agent | 配置 |
 |-------|-------|
-| Claude Code | `claude mcp add --scope user tokenmem -- node /path/to/mcp-server.mjs` |
+| Claude Code | `claude mcp add --scope user mneme -- node /path/to/mcp-server.mjs` |
 | Cursor | 加到 `.cursor/mcp.json` |
 | Windsurf | 加到 MCP server 配置 |
 | Cline / Continue | 加到 MCP settings |
@@ -264,8 +264,8 @@ v2.1 的 `× decay_score` 乘数让长时间未碰的记忆自然排到后面，
 ### 安装
 
 ```bash
-git clone https://github.com/MXAntian/tokenmem-better-memory-save-tokens.git
-cd tokenmem-better-memory-save-tokens
+git clone https://github.com/MXAntian/mneme.git
+cd mneme
 npm install
 ```
 
@@ -293,14 +293,14 @@ node index.mjs --stats
 
 **Claude Code：**
 ```bash
-claude mcp add --scope user tokenmem -- node /absolute/path/to/mcp-server.mjs
+claude mcp add --scope user mneme -- node /absolute/path/to/mcp-server.mjs
 ```
 
 **Cursor / Windsurf / 其他 MCP 客户端：**
 ```json
 {
   "mcpServers": {
-    "tokenmem": {
+    "mneme": {
       "command": "node",
       "args": ["/absolute/path/to/mcp-server.mjs"]
     }
@@ -313,9 +313,9 @@ claude mcp add --scope user tokenmem -- node /absolute/path/to/mcp-server.mjs
 加到你的 Agent 系统指令（比如 `CLAUDE.md`、`.cursorrules` 等）：
 
 ```markdown
-## 记忆系统（tokenmem MCP）
+## 记忆系统（mneme MCP）
 
-你能通过 `tokenmem` MCP server 访问一个持久化记忆数据库：
+你能通过 `mneme` MCP server 访问一个持久化记忆数据库：
 - `recall_memory(query, limit?, category?)` — 检索相关记忆
 - `store_memory(content, summary?, importance?, memory_type?, memory_level?, category?, tags?)` — 存重要信息
 - `memory_stats()` — 看统计
@@ -346,7 +346,7 @@ claude mcp add --scope user tokenmem -- node /absolute/path/to/mcp-server.mjs
 
 ## CLI 用法
 
-tokenmem 也能作为独立 CLI 工具——给 hook、脚本、调试用：
+mneme 也能作为独立 CLI 工具——给 hook、脚本、调试用：
 
 ```bash
 # 看统计
@@ -392,7 +392,7 @@ node backfill-embeddings.mjs --dry-run  # 仅统计不写入
 ## 文件结构
 
 ```
-tokenmem/
+mneme/
 ├── mcp-server.mjs              # MCP server 入口（stdio transport）
 ├── index.mjs                   # 核心引擎：存储、召回、混合搜索、压缩、衰减
 ├── schema.sql                  # SQLite schema（memories / conversations / FTS5 / goals）

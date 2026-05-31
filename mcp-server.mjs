@@ -62,10 +62,10 @@ initMemory()
 // 配合 .env.local 加载（上方）+ store_memory 走 storeMemoryAsync，
 // 让"绕过 async 写入路径导致永久缺向量"这条漏在每次重启时被兜住。
 embedMissingVectors(500).then(r => {
-  if (r.embedded || r.failed) console.error(`[tokenmem] startup self-heal: embedded ${r.embedded}, failed ${r.failed}, scanned ${r.scanned}`)
-}).catch(e => console.error(`[tokenmem] startup self-heal failed: ${e.message}`))
+  if (r.embedded || r.failed) console.error(`[mneme] startup self-heal: embedded ${r.embedded}, failed ${r.failed}, scanned ${r.scanned}`)
+}).catch(e => console.error(`[mneme] startup self-heal failed: ${e.message}`))
 
-const SERVER_NAME = 'tokenmem'
+const SERVER_NAME = 'mneme'
 const SERVER_VERSION = '2.2.0'
 
 // ── Factory: each call returns a fresh McpServer with all 4 tools registered ──
@@ -261,11 +261,11 @@ if (useHttp) {
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (newSessionId) => {
               sessions.set(newSessionId, { transport: newTransport, server: newServer, lastUsed: Date.now() })
-              console.error(`[tokenmem] session opened: ${newSessionId.slice(0, 8)} (total=${sessions.size})`)
+              console.error(`[mneme] session opened: ${newSessionId.slice(0, 8)} (total=${sessions.size})`)
             },
             onsessionclosed: (closedSessionId) => {
               sessions.delete(closedSessionId)
-              console.error(`[tokenmem] session closed: ${closedSessionId.slice(0, 8)} (total=${sessions.size})`)
+              console.error(`[mneme] session closed: ${closedSessionId.slice(0, 8)} (total=${sessions.size})`)
             },
           })
           await newServer.connect(newTransport)
@@ -277,7 +277,7 @@ if (useHttp) {
           res.writeHead(500, { 'Content-Type': 'text/plain' })
           res.end(`MCP transport error: ${e.message}`)
         }
-        console.error(`[tokenmem] handler error: ${e.message}`)
+        console.error(`[mneme] handler error: ${e.message}`)
       }
       return
     }
@@ -286,9 +286,9 @@ if (useHttp) {
   })
 
   httpServer.listen(PORT, HOST, () => {
-    console.error(`[tokenmem] HTTP MCP server listening on http://${HOST}:${PORT}/mcp (PID ${process.pid})`)
-    console.error(`[tokenmem] Health: http://${HOST}:${PORT}/health`)
-    console.error(`[tokenmem] Session idle cleanup: ${SESSION_IDLE_MS / 60000}min timeout, scan every ${SESSION_CLEANUP_INTERVAL_MS / 1000}s`)
+    console.error(`[mneme] HTTP MCP server listening on http://${HOST}:${PORT}/mcp (PID ${process.pid})`)
+    console.error(`[mneme] Health: http://${HOST}:${PORT}/health`)
+    console.error(`[mneme] Session idle cleanup: ${SESSION_IDLE_MS / 60000}min timeout, scan every ${SESSION_CLEANUP_INTERVAL_MS / 1000}s`)
   })
 
   // Idle session cleanup interval — kicks dead transports out of sessions Map
@@ -303,7 +303,7 @@ if (useHttp) {
       }
     }
     if (cleaned > 0) {
-      console.error(`[tokenmem] idle cleanup: -${cleaned} sessions, ${sessions.size} remaining`)
+      console.error(`[mneme] idle cleanup: -${cleaned} sessions, ${sessions.size} remaining`)
     }
   }, SESSION_CLEANUP_INTERVAL_MS)
   cleanupTimer.unref?.()  // 不阻止 process exit
