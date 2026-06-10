@@ -32,10 +32,18 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 //      the pre-rename era — silent migration would create a split-brain second
 //      DB; we'd rather keep using the populated one)
 //   3. tokenmem.db (default for fresh installs)
-const DB_PATH = process.env.TOKENMEM_DB_PATH
-  || (existsSync(resolve(__dirname, 'engram.db'))
-        ? resolve(__dirname, 'engram.db')
-        : resolve(__dirname, 'tokenmem.db'))
+// v2.1.3 (2026-06-11): 惰性解析 DB 路径。原 const 在 import 时求值，早于 caller 的 dotenv.config()，
+// 多租户 daemon 场景 .env.local 的 TOKENMEM_DB_PATH 来不及生效（爱芮 daemon 误用千夏 engram.db，冒烟实证）。
+// 改成首次 getDb() 求值——此时 caller 已 load .env.local。千夏不设此 env → 仍回落同模块 engram.db，行为不变。
+let _dbPath = null
+function resolveDbPath() {
+  if (_dbPath) return _dbPath
+  _dbPath = process.env.TOKENMEM_DB_PATH
+    || (existsSync(resolve(__dirname, 'engram.db'))
+          ? resolve(__dirname, 'engram.db')
+          : resolve(__dirname, 'tokenmem.db'))
+  return _dbPath
+}
 const SCHEMA_PATH = resolve(__dirname, 'schema.sql')
 // wangfenjin/simple Chinese tokenizer extension (optional)
 const SIMPLE_EXT_DIR = resolve(__dirname, 'lib/libsimple-windows-x64')
@@ -60,7 +68,7 @@ let _vecLoaded = false     // whether the sqlite-vec extension loaded successful
 function getDb() {
   if (_db) return _db
   const Database = require('better-sqlite3')
-  _db = new Database(DB_PATH)
+  _db = new Database(resolveDbPath())
   _db.pragma('journal_mode = WAL')
   _db.pragma('foreign_keys = ON')
   _db.pragma('busy_timeout = 5000')  // wait 5s on concurrent writes instead of immediate error
@@ -118,7 +126,7 @@ export function initMemory() {
     }
   }
 
-  log(`Initialized — DB at ${DB_PATH}`)
+  log(`Initialized — DB at ${resolveDbPath()}`)
 
   // ── FTS migration: if simple extension loaded but FTS uses old tokenizer, rebuild ──
   if (_simpleLoaded) {
@@ -246,6 +254,21 @@ export function initMemory() {
   } catch {}  // already exists
   try {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_source_conv ON memories(source_conversation_id) WHERE source_conversation_id IS NOT NULL`)
+  } catch {}
+  // migration 003: decay_score + prior_versions (power-law decay + supersede paper trail).
+  // Inline so upgrading an OLD db gets them without manually applying migrations/003 —
+  // otherwise recall's `AND decay_score >= ?` (strict/cold-pool path) throws "no such column".
+  // (2026-06-10: caught during 爱芮 engram v1.1→v2.2 upgrade — 003 was the only file not inlined.)
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN decay_score REAL NOT NULL DEFAULT 1.0`)
+    log('Migration: added decay_score column')
+  } catch {}  // already exists
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN prior_versions TEXT NOT NULL DEFAULT '[]'`)
+    log('Migration: added prior_versions column')
+  } catch {}
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_mem_surface_pool ON memories(importance, last_accessed, decay_score) WHERE deleted_at IS NULL AND superseded_by IS NULL AND importance >= 8`)
   } catch {}
 
   // Vector search virtual table (sqlite-vec)
